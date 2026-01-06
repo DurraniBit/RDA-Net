@@ -1,5 +1,5 @@
 """
-HSTRDA: Hybrid Sparse Transformer with Riemannian Geometry and Domain Adaptation
+RDA-Net: Riemannian Domain-Adaptive Network for EEG Motor Imagery Classification
 ------------------------------------------------------------------------------
 
 This script implements an end-to-end EEG motor imagery classification framework
@@ -317,7 +317,7 @@ class DomainDiscriminator(nn.Module):
 
 
 """
-    HSTRDA: Hybrid Sparse Transformer with Riemannian Domain Adaptation.
+    RDA-Net: Riemannian Domain-Adaptive Network for EEG Motor Imagery Classification
 
     Architecture Overview:
     ---------------------------------------------------
