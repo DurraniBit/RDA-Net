@@ -421,7 +421,7 @@ class ExP:
                  depth=4, 
                  dataset_type='A',
                  validate_ratio=0.2,
-                 learning_rate=0.0005,
+                 learning_rate=0.001,
                  batch_size=64,
                  window_size=5,
                  dropout=0.5,
