@@ -3,7 +3,7 @@ RDA-Net: Riemannian Domain-Adaptive Network for EEG Motor Imagery Classification
 ------------------------------------------------------------------------------
 
 This script implements an end-to-end EEG motor imagery classification framework
-designed for cross-subject and subject-dependent learning on BCI Competition IV
+designed for subject-dependent learning on BCI Competition IV
 datasets (2a / 2b).
 
 Core Components:
@@ -22,7 +22,8 @@ Core Components:
    - Uses window-based sparse self-attention to reduce complexity
    - Incorporates positional embeddings
 
-4. Domain Adaptation (DANN-style)
+4. Domain Adaptation (DANN-style, implemented but not used in this
+   subject-dependent training script)
    - Gradient Reversal Layer (GRL)
    - Domain discriminator for learning subject-invariant features
 
@@ -31,10 +32,10 @@ Core Components:
    - Improves robustness and class balance
 
 Training Strategies:
-- Subject-dependent or LOSO evaluation
-- Adversarial domain adaptation
+- Subject-dependent evaluation
 - AdamW optimizer with gradient clipping
-- Best-epoch model selection based on validation accuracy
+- Checkpoint selection based on minimum validation loss
+- Final test evaluation performed once after training
 
 This implementation is designed for research reproducibility and extensibility.
 """
@@ -523,154 +524,198 @@ class ExP:
         
         return train_data, train_label, test_data, test_label
 
-    def train(self):
-        # Get numpy arrays
-        source_data_np, source_label_np, test_data_np, test_label_np = self.get_source_data()
-        
-        # Prepare source domain data (training set)
-        source_data_tensor = torch.from_numpy(source_data_np).float()
-        source_label_tensor = torch.from_numpy(source_label_np - 1).long()
-        source_dataset = TensorDataset(source_data_tensor, source_label_tensor)
-        source_loader = DataLoader(source_dataset, batch_size=self.batch_size, shuffle=True)
-        
-        # Prepare target domain data (test set, without labels for adaptation)
-        target_data_tensor = torch.from_numpy(test_data_np).float()
-        target_loader = DataLoader(TensorDataset(target_data_tensor), batch_size=self.batch_size, shuffle=True)
-        
-        # Prepare test data (for evaluation)
-        test_label_tensor = torch.from_numpy(test_label_np - 1).long()
-        test_dataset = TensorDataset(target_data_tensor, test_label_tensor)
-        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
+    def stratified_train_val_split(self, labels, val_ratio=0.2, seed=2025):
+        """
+        Split only the training data into train/validation subsets.
+        The independent test set is not used for model selection.
+        Labels are expected in 1-based format: 1, 2, ..., K.
+        """
+        rng = np.random.RandomState(seed)
+        train_idx, val_idx = [], []
 
-        # Optimizer
+        for cls in np.unique(labels):
+            cls_indices = np.where(labels == cls)[0]
+            rng.shuffle(cls_indices)
+
+            n_val = max(1, int(len(cls_indices) * val_ratio))
+            val_idx.extend(cls_indices[:n_val])
+            train_idx.extend(cls_indices[n_val:])
+
+        train_idx = np.array(train_idx)
+        val_idx = np.array(val_idx)
+        rng.shuffle(train_idx)
+        rng.shuffle(val_idx)
+        return train_idx, val_idx
+
+    def evaluate_loader(self, loader, return_preds=False):
+        """Evaluate a dataloader without parameter updates."""
+        self.model.eval()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        all_preds, all_labels = [], []
+
+        with torch.no_grad():
+            for data, labels in loader:
+                data = data.cuda().float()
+                labels = labels.cuda().long()
+
+                outputs, _ = self.model(data, domain_adapt=False)
+                loss = self.criterion_cls(outputs, labels)
+                preds = torch.argmax(outputs, dim=1)
+
+                total_loss += loss.item() * labels.size(0)
+                total_correct += (preds == labels).sum().item()
+                total_samples += labels.size(0)
+
+                if return_preds:
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(labels.cpu().numpy())
+
+        avg_loss = total_loss / max(total_samples, 1)
+        avg_acc = total_correct / max(total_samples, 1)
+
+        if return_preds:
+            return avg_loss, avg_acc, np.array(all_labels), np.array(all_preds)
+        return avg_loss, avg_acc
+
+    def train(self):
+        # Load data. The test set remains unseen until final evaluation.
+        source_data_np, source_label_np, test_data_np, test_label_np = self.get_source_data()
+
+        # ---------------------------------------------------------
+        # 1. Create validation split from training data only
+        # ---------------------------------------------------------
+        train_idx, val_idx = self.stratified_train_val_split(
+            source_label_np,
+            val_ratio=self.validate_ratio,
+            seed=2025 + self.nSub
+        )
+
+        train_data_np = source_data_np[train_idx]
+        train_label_np = source_label_np[train_idx]
+        val_data_np = source_data_np[val_idx]
+        val_label_np = source_label_np[val_idx]
+
+        train_dataset = TensorDataset(
+            torch.from_numpy(train_data_np).float(),
+            torch.from_numpy(train_label_np - 1).long()
+        )
+        val_dataset = TensorDataset(
+            torch.from_numpy(val_data_np).float(),
+            torch.from_numpy(val_label_np - 1).long()
+        )
+        test_dataset = TensorDataset(
+            torch.from_numpy(test_data_np).float(),
+            torch.from_numpy(test_label_np - 1).long()
+        )
+
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False)
+        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, drop_last=False)
+
+        # ---------------------------------------------------------
+        # 2. Subject-dependent training: no domain adaptation and no test-set use
+        # ---------------------------------------------------------
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), 
-            lr=self.lr, 
+            self.model.parameters(),
+            lr=self.lr,
             weight_decay=1e-4
         )
 
-        best_acc = 0
+        best_val_loss = float('inf')
+        best_val_acc = 0.0
         best_epoch = 0
-        results = []
-        
+        patience_counter = 0
+        patience = 300
+        history = []
+
         for epoch in range(self.n_epochs):
             self.model.train()
-            epoch_loss = 0
-            cls_loss_total = 0
-            da_loss_total = 0
-            
-            # Create iterators for both domains
-            source_iter = iter(source_loader)
-            target_iter = iter(target_loader)
-            
-            for i in range(len(source_loader)):
-                try:
-                    source_x, source_y = next(source_iter)
-                except StopIteration:
-                    source_iter = iter(source_loader)
-                    source_x, source_y = next(source_iter)
-                
-                try:
-                    target_x = next(target_iter)[0]  # Get only data, no label
-                except StopIteration:
-                    target_iter = iter(target_loader)
-                    target_x = next(target_iter)[0]
-                
-                # Move to GPU
-                source_x = source_x.cuda()
-                source_y = source_y.cuda()
-                target_x = target_x.cuda()
-                
-                # Generate augmented source data
-                aug_x, aug_y = self.interaug(source_data_np, source_label_np)
-                
-                # Combine source and augmented data
+            epoch_loss = 0.0
+            cls_loss_total = 0.0
+            num_batches = 0
+
+            for source_x, source_y in train_loader:
+                source_x = source_x.cuda().float()
+                source_y = source_y.cuda().long()
+
+                # Augment training data only, never validation/test data.
+                aug_x, aug_y = self.interaug(train_data_np, train_label_np)
+
                 if len(aug_x) > 0:
-                    combined_x = torch.cat([source_x, aug_x])
-                    combined_y = torch.cat([source_y, aug_y])
+                    combined_x = torch.cat([source_x, aug_x], dim=0)
+                    combined_y = torch.cat([source_y, aug_y], dim=0)
                 else:
                     combined_x = source_x
                     combined_y = source_y
-                
-                # Forward pass for source domain
-                cls_out, _ = self.model(combined_x)
-                cls_loss = self.criterion_cls(cls_out, combined_y)
-                
-                # Domain adaptation between source and target
-                domain_x = torch.cat([source_x, target_x])
-                _, domain_out = self.model(domain_x, domain_adapt=True)
-                
-                # Domain labels: 0 for source, 1 for target
-                domain_labels = torch.cat([
-                    torch.zeros(source_x.size(0), 1),
-                    torch.ones(target_x.size(0), 1)
-                ]).cuda()
-                
-                da_loss = self.criterion_domain(domain_out, domain_labels)
-                
-                # Total loss
-                total_loss = cls_loss + self.da_lambda * da_loss
-                
-                # Backward and optimize
+
+                outputs, _ = self.model(combined_x, domain_adapt=False)
+                cls_loss = self.criterion_cls(outputs, combined_y)
+
                 self.optimizer.zero_grad()
-                total_loss.backward()
+                cls_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
-                
-                epoch_loss += total_loss.item()
+
+                epoch_loss += cls_loss.item()
                 cls_loss_total += cls_loss.item()
-                da_loss_total += da_loss.item()
-            
-            # Validation
-            self.model.eval()
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for data, labels in test_loader:
-                    data = data.cuda()
-                    labels = labels.cuda()
-                    
-                    outputs, _ = self.model(data)
-                    _, predicted = torch.max(outputs.data, 1)
-                    total += labels.size(0)
-                    correct += (predicted == labels).sum().item()
-            
-            acc = 100 * correct / total
-            results.append(acc)
-            
+                num_batches += 1
+
+            # -----------------------------------------------------
+            # 3. Validation: select checkpoint by minimum validation loss
+            # -----------------------------------------------------
+            val_loss, val_acc = self.evaluate_loader(val_loader)
+
+            history.append({
+                'epoch': epoch + 1,
+                'train_loss': epoch_loss / max(num_batches, 1),
+                'cls_loss': cls_loss_total / max(num_batches, 1),
+                'val_loss': val_loss,
+                'val_acc': val_acc * 100
+            })
+
             print(f'Epoch [{epoch+1}/{self.n_epochs}] | '
-                  f'Loss: {epoch_loss/len(source_loader):.4f} | '
-                  f'Cls Loss: {cls_loss_total/len(source_loader):.4f} | '
-                  f'DA Loss: {da_loss_total/len(source_loader):.4f} | '
-                  f'Acc: {acc:.2f}%')
-            
-            # Save best model
-            if acc > best_acc:
-                best_acc = acc
-                best_epoch = epoch
+                  f'Train Loss: {epoch_loss/max(num_batches, 1):.4f} | '
+                  f'Val Loss: {val_loss:.4f} | '
+                  f'Val Acc: {val_acc*100:.2f}%')
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_val_acc = val_acc
+                best_epoch = epoch + 1
+                patience_counter = 0
                 torch.save(self.model.state_dict(), self.model_filename)
-        
-        # Load best model for final test
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f'Early stopping at epoch {epoch+1}')
+                break
+
+        # ---------------------------------------------------------
+        # 4. Final test: evaluate the independent test set only once
+        # ---------------------------------------------------------
         self.model.load_state_dict(torch.load(self.model_filename))
         self.model.eval()
-        all_preds = []
-        all_labels = []
-        with torch.no_grad():
-            for data, labels in test_loader:
-                data = data.cuda()
-                outputs, _ = self.model(data)
-                _, preds = torch.max(outputs, 1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
-        accuracy, precison, recall, f1, kappa = calMetrics(
-            np.array(all_labels), np.array(all_preds)
+
+        test_loss, test_acc, all_labels, all_preds = self.evaluate_loader(
+            test_loader,
+            return_preds=True
         )
-        
+
+        accuracy, precison, recall, f1, kappa = calMetrics(
+            np.array(all_labels),
+            np.array(all_preds)
+        )
+
         print(f'Subject {self.nSub} | Best Epoch: {best_epoch} | '
-              f'Test Acc: {accuracy:.4f} | Kappa: {kappa:.4f}')
-        
-        return accuracy, all_labels, all_preds, best_epoch
+              f'Best Val Loss: {best_val_loss:.4f} | '
+              f'Best Val Acc: {best_val_acc*100:.2f}% | '
+              f'Final Test Acc: {accuracy:.4f} | Kappa: {kappa:.4f}')
+
+        df_history = pd.DataFrame(history)
+        return accuracy, all_labels, all_preds, best_epoch, df_history
 
 
 def main(dirs,                
@@ -709,7 +754,7 @@ def main(dirs,
         
         exp = ExP(
             nsub=subject,
-            data_dir='/data0/Durrani/BCICIV_2a/',
+            data_dir='/data0/Durrani/mymat_raw/',
             result_name=dirs,
             evaluate_mode=evaluate_mode,
             heads=heads,
@@ -727,7 +772,8 @@ def main(dirs,
             number_seg=number_seg
         )
         
-        acc, true, pred, epoch = exp.train()
+        acc, true, pred, epoch, df_history = exp.train()
+        df_history.to_excel(os.path.join(dirs, f'training_history_subject_{subject}.xlsx'), index=False)
         results.append({
             'Subject': subject,
             'Accuracy': acc,
@@ -755,7 +801,7 @@ if __name__ == "__main__":
     
     main(
         dirs=RESULT_DIR,
-        evaluate_mode='subject-dependent',  # Or 'LOSO'
+        evaluate_mode='subject-dependent',
         heads=8,
         emb_size=48,
         depth=4,
@@ -770,6 +816,4 @@ if __name__ == "__main__":
         batch_size=64,
         da_lambda=0.5
     )
-
-
     
