@@ -48,23 +48,6 @@ bash scripts/reproduce_all.sh
 | Table 6 (complexity) | `scripts/complexity.py` |
 | Table 7 (condition numbers) | `scripts/condition_numbers.py` |
 
-
-
-Our research builds upon and improves the [EEG Conformer](https://github.com/eeyhsong/EEG-Conformer) and [RGN](https://github.com/shiroger/Riemannian-Geometry-Networks), and we sincerely thank the creators of these open-source project.
-
-
-### Abstract:
-
-
-### Overall Framework:
-![architecture of RDA-Net](main/architecture.png)
-
-
-
-### Citation
-Hope this code can be useful. I would appreciate you citing us in your paper. 😊
-
 ## License
 
 MIT
-
